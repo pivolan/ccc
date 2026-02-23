@@ -7,81 +7,293 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
 
-// readHookStdin reads stdin JSON with a timeout
+// HookData represents data received from Claude hook
+type HookData struct {
+	Cwd            string `json:"cwd"`
+	TranscriptPath string `json:"transcript_path"`
+	SessionID      string `json:"session_id"`
+	HookEventName  string `json:"hook_event_name"`
+	Message        string `json:"message"`
+	Title          string `json:"title"`
+}
+
+// configFromArgs parses --token and --chat-id flags from os.Args (e.g. "ccc hook-stop --token=X --chat-id=Y")
+func configFromArgs() *Config {
+	var token string
+	var chatStr string
+	for _, arg := range os.Args[2:] {
+		if strings.HasPrefix(arg, "--token=") {
+			token = strings.TrimPrefix(arg, "--token=")
+		} else if strings.HasPrefix(arg, "--chat-id=") {
+			chatStr = strings.TrimPrefix(arg, "--chat-id=")
+		}
+	}
+	if token == "" || chatStr == "" {
+		return nil
+	}
+	chatID, err := strconv.ParseInt(chatStr, 10, 64)
+	if err != nil {
+		return nil
+	}
+	return &Config{BotToken: token, ChatID: chatID}
+}
+
 func readHookStdin() ([]byte, error) {
-	stdinData := make(chan []byte, 1)
+	ch := make(chan []byte, 1)
 	go func() {
 		defer func() { recover() }()
 		data, _ := io.ReadAll(os.Stdin)
-		stdinData <- data
+		ch <- data
 	}()
 
 	select {
-	case rawData := <-stdinData:
-		return rawData, nil
+	case data := <-ch:
+		return data, nil
 	case <-time.After(2 * time.Second):
 		return nil, nil
 	}
 }
 
-// findSession matches a hook's cwd to a configured session
-func findSession(config *Config, cwd string) (string, int64) {
-	for name, info := range config.Sessions {
-		if name == "" || info == nil {
-			continue
-		}
-		if cwd == info.Path || strings.HasPrefix(cwd, info.Path+"/") || strings.HasSuffix(cwd, "/"+name) {
-			return name, info.TopicID
-		}
+func debugLog(format string, args ...interface{}) {
+	f, err := os.OpenFile("/tmp/ccc-debug.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return
 	}
-	return "", 0
+	defer f.Close()
+	fmt.Fprintf(f, format+"\n", args...)
 }
 
-func handleStopHook() error {
+func handleStopHook() {
 	defer func() { recover() }()
+
+	config := configFromArgs()
+	if config == nil {
+		debugLog("configFromArgs returned nil")
+		return
+	}
 
 	rawData, _ := readHookStdin()
 	if len(rawData) == 0 {
-		return nil
+		debugLog("rawData is empty")
+		return
+	}
+
+	debugLog("stdin: %s", string(rawData))
+
+	var hookData HookData
+	if json.Unmarshal(rawData, &hookData) != nil {
+		debugLog("failed to unmarshal hookData")
+		return
+	}
+
+	debugLog("transcriptPath: %s", hookData.TranscriptPath)
+
+	// Wait for transcript to be flushed to disk
+	time.Sleep(500 * time.Millisecond)
+
+	blocks := extractLastTurn(hookData.TranscriptPath)
+	debugLog("extractLastTurn returned %d blocks", len(blocks))
+	if len(blocks) == 0 {
+		sendMessage(config, config.ChatID, "Done.")
+		return
+	}
+
+	for _, block := range blocks {
+		sendMessage(config, config.ChatID, block)
+	}
+}
+
+// PermissionHookData represents PreToolUse hook input
+type PermissionHookData struct {
+	SessionID      string          `json:"session_id"`
+	TranscriptPath string          `json:"transcript_path"`
+	Cwd            string          `json:"cwd"`
+	HookEventName  string          `json:"hook_event_name"`
+	ToolName       string          `json:"tool_name"`
+	ToolInput      json.RawMessage `json:"tool_input"`
+	ToolUseID      string          `json:"tool_use_id"`
+}
+
+const permissionsDir = "/tmp/ccc-permissions"
+const alwaysAllowFile = "/tmp/ccc-permissions/always_allow.json"
+
+func loadAlwaysAllow() map[string]bool {
+	data, err := os.ReadFile(alwaysAllowFile)
+	if err != nil {
+		return make(map[string]bool)
+	}
+	var m map[string]bool
+	if json.Unmarshal(data, &m) != nil {
+		return make(map[string]bool)
+	}
+	return m
+}
+
+func saveAlwaysAllow(m map[string]bool) {
+	data, _ := json.Marshal(m)
+	os.WriteFile(alwaysAllowFile, data, 0644)
+}
+
+func handlePermissionHook() {
+	defer func() { recover() }()
+
+	config := configFromArgs()
+	if config == nil {
+		return
+	}
+
+	rawData, _ := readHookStdin()
+	if len(rawData) == 0 {
+		return
+	}
+
+	var hookData PermissionHookData
+	if json.Unmarshal(rawData, &hookData) != nil {
+		return
+	}
+
+	// Check "always allow" list
+	os.MkdirAll(permissionsDir, 0755)
+	allowed := loadAlwaysAllow()
+	if allowed[hookData.ToolName] {
+		result := map[string]interface{}{
+			"hookSpecificOutput": map[string]interface{}{
+				"hookEventName":    "PreToolUse",
+				"permissionDecision": "allow",
+			},
+		}
+		json.NewEncoder(os.Stdout).Encode(result)
+		return
+	}
+
+	// Build human-readable description
+	desc := formatToolDescription(hookData.ToolName, hookData.ToolInput)
+	text := fmt.Sprintf("Permission: %s\n\n%s", hookData.ToolName, desc)
+
+	// Create IPC request file — use short ID for Telegram callback_data (64 byte limit)
+	reqID := fmt.Sprintf("%d", time.Now().UnixNano()%1000000000)
+	reqPath := filepath.Join(permissionsDir, reqID+".req")
+	respPath := filepath.Join(permissionsDir, reqID+".resp")
+
+	os.WriteFile(reqPath, rawData, 0644)
+	defer os.Remove(reqPath)
+	defer os.Remove(respPath)
+
+	// Send Telegram message with 3 buttons
+	// Telegram callback_data max 64 bytes — truncate tool name if needed
+	toolNameShort := hookData.ToolName
+	maxToolLen := 64 - len("perm:"+reqID+":always:")
+	if len(toolNameShort) > maxToolLen {
+		toolNameShort = toolNameShort[:maxToolLen]
+	}
+	keyboard := map[string]interface{}{
+		"inline_keyboard": []interface{}{
+			[]interface{}{
+				map[string]interface{}{"text": "Yes", "callback_data": "perm:" + reqID + ":allow"},
+				map[string]interface{}{"text": "Always", "callback_data": "perm:" + reqID + ":always:" + toolNameShort},
+				map[string]interface{}{"text": "No", "callback_data": "perm:" + reqID + ":deny"},
+			},
+		},
+	}
+
+	_, err := sendMessageWithKeyboard(config, config.ChatID, text, keyboard)
+	if err != nil {
+		return
+	}
+
+	// Wait for response (up to 9 minutes)
+	deadline := time.Now().Add(9 * time.Minute)
+	for time.Now().Before(deadline) {
+		data, err := os.ReadFile(respPath)
+		if err == nil && len(data) > 0 {
+			decision := strings.TrimSpace(string(data))
+			result := map[string]interface{}{
+				"hookSpecificOutput": map[string]interface{}{
+					"hookEventName":    "PreToolUse",
+					"permissionDecision": decision,
+				},
+			}
+			json.NewEncoder(os.Stdout).Encode(result)
+			return
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+
+	// Timeout — deny
+	result := map[string]interface{}{
+		"hookSpecificOutput": map[string]interface{}{
+			"hookEventName":          "PreToolUse",
+			"permissionDecision":     "deny",
+			"permissionDecisionReason": "Permission request timed out",
+		},
+	}
+	json.NewEncoder(os.Stdout).Encode(result)
+}
+
+func formatToolDescription(toolName string, toolInput json.RawMessage) string {
+	var input map[string]interface{}
+	if json.Unmarshal(toolInput, &input) != nil {
+		return string(toolInput)
+	}
+
+	switch toolName {
+	case "Bash":
+		if cmd, ok := input["command"].(string); ok {
+			return fmt.Sprintf("```\n%s\n```", cmd)
+		}
+	case "Write":
+		if fp, ok := input["file_path"].(string); ok {
+			return fmt.Sprintf("Write file: %s", fp)
+		}
+	case "Edit":
+		if fp, ok := input["file_path"].(string); ok {
+			return fmt.Sprintf("Edit file: %s", fp)
+		}
+	}
+
+	// Generic: show key=value pairs
+	var parts []string
+	for k, v := range input {
+		s := fmt.Sprintf("%v", v)
+		if len(s) > 200 {
+			s = s[:200] + "..."
+		}
+		parts = append(parts, fmt.Sprintf("%s: %s", k, s))
+	}
+	return strings.Join(parts, "\n")
+}
+
+func handleNotificationHook() {
+	defer func() { recover() }()
+
+	config := configFromArgs()
+	if config == nil {
+		return
+	}
+
+	rawData, _ := readHookStdin()
+	if len(rawData) == 0 {
+		return
 	}
 
 	var hookData HookData
-	if err := json.Unmarshal(rawData, &hookData); err != nil {
-		return nil
+	if json.Unmarshal(rawData, &hookData) != nil {
+		return
 	}
 
-	config, err := loadConfig()
-	if err != nil || config == nil {
-		return nil
+	title := hookData.Title
+	message := hookData.Message
+	if title == "" && message == "" {
+		return
 	}
 
-	sessName, topicID := findSession(config, hookData.Cwd)
-	if sessName == "" || config.GroupID == 0 || topicID == 0 {
-		return nil
-	}
-
-	hookLog("stop-hook: session=%s transcript=%s", sessName, hookData.TranscriptPath)
-
-	blocks := extractLastTurn(hookData.TranscriptPath)
-	if len(blocks) == 0 {
-		// No text blocks found, just send completion marker
-		sendMessage(config, config.GroupID, topicID, fmt.Sprintf("✅ %s", sessName))
-		return nil
-	}
-
-	for i, block := range blocks {
-		text := block
-		if i == len(blocks)-1 {
-			text = fmt.Sprintf("✅ %s\n\n%s", sessName, block)
-		}
-		sendMessageGetID(config, config.GroupID, topicID, text)
-	}
-
-	return nil
+	text := fmt.Sprintf("%s\n\n%s", title, message)
+	sendMessage(config, config.ChatID, strings.TrimSpace(text))
 }
 
 // extractLastTurn reads the JSONL transcript and extracts text blocks from
@@ -98,14 +310,12 @@ func extractLastTurn(transcriptPath string) []string {
 	defer f.Close()
 
 	type contentBlock struct {
-		Type    string `json:"type"`
-		Text    string `json:"text"`
-		Name    string `json:"name,omitempty"`
-		Content string `json:"content,omitempty"`
+		Type string `json:"type"`
+		Text string `json:"text"`
 	}
 
 	type message struct {
-		Role    string         `json:"role"`
+		Role    string          `json:"role"`
 		Content json.RawMessage `json:"content"`
 	}
 
@@ -115,7 +325,6 @@ func extractLastTurn(transcriptPath string) []string {
 		Message   message `json:"message"`
 	}
 
-	// Parse all lines
 	type parsedEntry struct {
 		ttype     string
 		requestID string
@@ -125,16 +334,20 @@ func extractLastTurn(transcriptPath string) []string {
 
 	var entries []parsedEntry
 	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 0, 1024*1024), 10*1024*1024) // 10MB max line
+	scanner.Buffer(make([]byte, 0, 1024*1024), 10*1024*1024)
+	lineNum := 0
 	for scanner.Scan() {
 		line := scanner.Bytes()
+		lineNum++
 		if len(line) == 0 {
 			continue
 		}
 		var tl transcriptLine
 		if json.Unmarshal(line, &tl) != nil {
+			debugLog("line %d: unmarshal failed, first 200 chars: %s", lineNum, truncStr(string(line), 200))
 			continue
 		}
+		debugLog("line %d: type=%q requestID=%q role=%q contentLen=%d", lineNum, tl.Type, tl.RequestID, tl.Message.Role, len(tl.Message.Content))
 		entries = append(entries, parsedEntry{
 			ttype:     tl.Type,
 			requestID: tl.RequestID,
@@ -143,6 +356,7 @@ func extractLastTurn(transcriptPath string) []string {
 		})
 	}
 
+	debugLog("total entries parsed: %d", len(entries))
 	if len(entries) == 0 {
 		return nil
 	}
@@ -154,7 +368,6 @@ func extractLastTurn(transcriptPath string) []string {
 		if e.ttype != "user" && e.role != "user" {
 			continue
 		}
-		// Check if content is a tool_result
 		if isToolResult(e.content) {
 			continue
 		}
@@ -163,16 +376,16 @@ func extractLastTurn(transcriptPath string) []string {
 	}
 
 	// Collect text from assistant messages after the last user message.
-	// Streaming dedup: same requestId may have multiple entries with progressively
-	// updated text; for each requestId, the last entry's text blocks win.
+	// Streaming dedup: same requestId may have multiple entries;
+	// for each requestId, the last entry's text blocks win.
 	startIdx := lastUserIdx + 1
 	if lastUserIdx < 0 {
 		startIdx = 0
 	}
 
-	reqTexts := make(map[string][]string) // requestId -> text blocks from last entry
-	var orderedKeys []string              // preserve order of first appearance
-	var noIDTexts []string                // texts from entries without requestId
+	reqTexts := make(map[string][]string)
+	var orderedKeys []string
+	var noIDTexts []string
 
 	for i := startIdx; i < len(entries); i++ {
 		e := entries[i]
@@ -206,7 +419,7 @@ func extractLastTurn(transcriptPath string) []string {
 			if _, seen := reqTexts[e.requestID]; !seen {
 				orderedKeys = append(orderedKeys, e.requestID)
 			}
-			reqTexts[e.requestID] = entryTexts // last entry with text wins
+			reqTexts[e.requestID] = entryTexts
 		}
 	}
 
@@ -219,12 +432,17 @@ func extractLastTurn(transcriptPath string) []string {
 	return texts
 }
 
-// isToolResult checks if content JSON contains tool_result entries
+func truncStr(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	return s[:max]
+}
+
 func isToolResult(content json.RawMessage) bool {
 	if len(content) == 0 {
 		return false
 	}
-	// Try as array of objects
 	var blocks []struct {
 		Type string `json:"type"`
 	}
@@ -238,398 +456,65 @@ func isToolResult(content json.RawMessage) bool {
 	return false
 }
 
-func handlePermissionHook() error {
-	defer func() { recover() }()
-
-	rawData, _ := readHookStdin()
-	if len(rawData) == 0 {
-		return nil
+// installProjectHooks writes .claude/settings.local.json in workDir with Stop and Notification hooks
+func installProjectHooks(workDir string, config *Config) error {
+	claudeDir := filepath.Join(workDir, ".claude")
+	if err := os.MkdirAll(claudeDir, 0755); err != nil {
+		return err
 	}
 
-	var hookData HookData
-	if err := json.Unmarshal(rawData, &hookData); err != nil {
-		return nil
+	cccBin, _ := os.Executable()
+	if cccBin == "" {
+		cccBin = "ccc"
 	}
 
-	config, err := loadConfig()
-	if err != nil || config == nil {
-		return nil
-	}
+	hookArgs := fmt.Sprintf(" --token=%s --chat-id=%d", config.BotToken, config.ChatID)
 
-	sessName, topicID := findSession(config, hookData.Cwd)
-	if sessName == "" || config.GroupID == 0 {
-		return nil
-	}
-
-	// Handle AskUserQuestion
-	if hookData.ToolName == "AskUserQuestion" && len(hookData.ToolInput.Questions) > 0 {
-		go func() {
-			defer func() { recover() }()
-			for qIdx, q := range hookData.ToolInput.Questions {
-				if q.Question == "" {
-					continue
-				}
-				msg := fmt.Sprintf("❓ %s\n\n%s", q.Header, q.Question)
-
-				var buttons [][]InlineKeyboardButton
-				for i, opt := range q.Options {
-					if opt.Label == "" {
-						continue
-					}
-					totalQuestions := len(hookData.ToolInput.Questions)
-					callbackData := fmt.Sprintf("%s:%d:%d:%d", sessName, qIdx, totalQuestions, i)
-					if len(callbackData) > 64 {
-						callbackData = callbackData[:64]
-					}
-					buttons = append(buttons, []InlineKeyboardButton{
-						{Text: opt.Label, CallbackData: callbackData},
-					})
-				}
-
-				if len(buttons) > 0 {
-					sendMessageWithKeyboard(config, config.GroupID, topicID, msg, buttons)
-				}
-			}
-		}()
-		return nil
-	}
-
-	return nil
-}
-
-func handleQuestionHook() error {
-	config, err := loadConfig()
-	if err != nil {
-		return nil
-	}
-
-	rawData, _ := io.ReadAll(os.Stdin)
-	if len(rawData) == 0 {
-		return nil
-	}
-
-	var hookData HookData
-	if err := json.Unmarshal(rawData, &hookData); err != nil {
-		return nil
-	}
-
-	sessName, topicID := findSession(config, hookData.Cwd)
-	if sessName == "" || config.GroupID == 0 || topicID == 0 {
-		return nil
-	}
-
-	for qIdx, q := range hookData.ToolInput.Questions {
-		if q.Question == "" {
-			continue
-		}
-		msg := fmt.Sprintf("❓ %s\n\n%s", q.Header, q.Question)
-
-		var buttons [][]InlineKeyboardButton
-		for i, opt := range q.Options {
-			if opt.Label == "" {
-				continue
-			}
-			totalQuestions := len(hookData.ToolInput.Questions)
-			callbackData := fmt.Sprintf("%s:%d:%d:%d", sessName, qIdx, totalQuestions, i)
-			if len(callbackData) > 64 {
-				callbackData = callbackData[:64]
-			}
-			buttons = append(buttons, []InlineKeyboardButton{
-				{Text: opt.Label, CallbackData: callbackData},
-			})
-		}
-
-		if len(buttons) > 0 {
-			sendMessageWithKeyboard(config, config.GroupID, topicID, msg, buttons)
-		} else {
-			sendMessage(config, config.GroupID, topicID, msg)
-		}
-	}
-
-	return nil
-}
-
-func handleNotificationHook() error {
-	defer func() { recover() }()
-
-	rawData, _ := readHookStdin()
-	if len(rawData) == 0 {
-		return nil
-	}
-
-	var hookData HookData
-	if err := json.Unmarshal(rawData, &hookData); err != nil {
-		return nil
-	}
-
-	config, err := loadConfig()
-	if err != nil || config == nil {
-		return nil
-	}
-
-	sessName, topicID := findSession(config, hookData.Cwd)
-	if sessName == "" || config.GroupID == 0 || topicID == 0 {
-		return nil
-	}
-
-	title := hookData.Title
-	message := hookData.Message
-	if title == "" && message == "" {
-		return nil
-	}
-
-	text := fmt.Sprintf("🔔 %s\n\n%s", title, message)
-	sendMessage(config, config.GroupID, topicID, strings.TrimSpace(text))
-
-	return nil
-}
-
-// isCccHook checks if a hook entry contains a ccc command
-func isCccHook(entry interface{}) bool {
-	if m, ok := entry.(map[string]interface{}); ok {
-		if cmd, ok := m["command"].(string); ok {
-			return strings.Contains(cmd, "ccc hook")
-		}
-		if hooks, ok := m["hooks"].([]interface{}); ok {
-			for _, h := range hooks {
-				if hm, ok := h.(map[string]interface{}); ok {
-					if cmd, ok := hm["command"].(string); ok {
-						if strings.Contains(cmd, "ccc hook") {
-							return true
-						}
-					}
-				}
-			}
-		}
-	}
-	return false
-}
-
-func removeCccHooks(hookArray []interface{}) []interface{} {
-	var result []interface{}
-	for _, entry := range hookArray {
-		if !isCccHook(entry) {
-			result = append(result, entry)
-		}
-	}
-	return result
-}
-
-func installHook() error {
-	home, _ := os.UserHomeDir()
-	settingsPath := filepath.Join(home, ".claude", "settings.json")
-
-	data, err := os.ReadFile(settingsPath)
-	if err != nil {
-		return fmt.Errorf("failed to read settings.json: %w", err)
-	}
-
-	var settings map[string]interface{}
-	if err := json.Unmarshal(data, &settings); err != nil {
-		return fmt.Errorf("failed to parse settings.json: %w", err)
-	}
-
-	hooks, ok := settings["hooks"].(map[string]interface{})
-	if !ok {
-		hooks = make(map[string]interface{})
-	}
-
-	cccHooks := map[string][]interface{}{
-		"PreToolUse": {
-			map[string]interface{}{
-				"hooks": []interface{}{
-					map[string]interface{}{
-						"command": cccPath + " hook-question",
-						"type":    "command",
-					},
-				},
-				"matcher": "AskUserQuestion",
-			},
-		},
-		"Stop": {
-			map[string]interface{}{
-				"hooks": []interface{}{
-					map[string]interface{}{
-						"command": cccPath + " hook-stop",
-						"type":    "command",
+	settings := map[string]interface{}{
+		"hooks": map[string]interface{}{
+			"PreToolUse": []interface{}{
+				map[string]interface{}{
+					"hooks": []interface{}{
+						map[string]interface{}{
+							"type":    "command",
+							"command": cccBin + " hook-permission" + hookArgs,
+						},
 					},
 				},
 			},
-		},
-		"Notification": {
-			map[string]interface{}{
-				"hooks": []interface{}{
-					map[string]interface{}{
-						"command": cccPath + " hook-notification",
-						"type":    "command",
+			"Stop": []interface{}{
+				map[string]interface{}{
+					"hooks": []interface{}{
+						map[string]interface{}{
+							"type":    "command",
+							"command": cccBin + " hook-stop" + hookArgs,
+						},
+					},
+				},
+			},
+			"Notification": []interface{}{
+				map[string]interface{}{
+					"hooks": []interface{}{
+						map[string]interface{}{
+							"type":    "command",
+							"command": cccBin + " hook-notification" + hookArgs,
+						},
 					},
 				},
 			},
 		},
 	}
 
-	// Remove ALL existing ccc hooks from all hook types
-	allHookTypes := []string{"Stop", "Notification", "PermissionRequest", "PostToolUse", "PreToolUse", "UserPromptSubmit"}
-	for _, hookType := range allHookTypes {
-		if existing, ok := hooks[hookType].([]interface{}); ok {
-			filtered := removeCccHooks(existing)
-			if len(filtered) == 0 {
-				delete(hooks, hookType)
-			} else {
-				hooks[hookType] = filtered
-			}
-		}
-	}
-
-	// Add only the hooks we need
-	for hookType, newHooks := range cccHooks {
-		var existingHooks []interface{}
-		if existing, ok := hooks[hookType].([]interface{}); ok {
-			existingHooks = existing
-		}
-		hooks[hookType] = append(newHooks, existingHooks...)
-	}
-
-	settings["hooks"] = hooks
-
-	newData, err := json.MarshalIndent(settings, "", "  ")
+	data, err := json.MarshalIndent(settings, "", "  ")
 	if err != nil {
-		return fmt.Errorf("failed to marshal settings: %w", err)
+		return err
 	}
 
-	if err := os.WriteFile(settingsPath, newData, 0600); err != nil {
-		return fmt.Errorf("failed to write settings.json: %w", err)
-	}
-
-	fmt.Println("✅ Claude hooks installed!")
-	return nil
+	return os.WriteFile(filepath.Join(claudeDir, "settings.local.json"), data, 0600)
 }
 
-func uninstallHook() error {
-	home, _ := os.UserHomeDir()
-	settingsPath := filepath.Join(home, ".claude", "settings.json")
-
-	data, err := os.ReadFile(settingsPath)
-	if err != nil {
-		return fmt.Errorf("failed to read settings.json: %w", err)
-	}
-
-	var settings map[string]interface{}
-	if err := json.Unmarshal(data, &settings); err != nil {
-		return fmt.Errorf("failed to parse settings.json: %w", err)
-	}
-
-	hooks, ok := settings["hooks"].(map[string]interface{})
-	if !ok {
-		fmt.Println("No hooks found")
-		return nil
-	}
-
-	hookTypes := []string{"Stop", "Notification", "PermissionRequest", "PostToolUse", "PreToolUse", "UserPromptSubmit"}
-	for _, hookType := range hookTypes {
-		if existing, ok := hooks[hookType].([]interface{}); ok {
-			filtered := removeCccHooks(existing)
-			if len(filtered) == 0 {
-				delete(hooks, hookType)
-			} else {
-				hooks[hookType] = filtered
-			}
-		}
-	}
-
-	settings["hooks"] = hooks
-
-	newData, err := json.MarshalIndent(settings, "", "  ")
-	if err != nil {
-		return fmt.Errorf("failed to marshal settings: %w", err)
-	}
-
-	if err := os.WriteFile(settingsPath, newData, 0600); err != nil {
-		return fmt.Errorf("failed to write settings.json: %w", err)
-	}
-
-	fmt.Println("✅ Claude hooks uninstalled!")
-	return nil
-}
-
-func installSkill() error {
-	home, _ := os.UserHomeDir()
-	skillDir := filepath.Join(home, ".claude", "skills")
-	skillPath := filepath.Join(skillDir, "ccc-send.md")
-
-	if err := os.MkdirAll(skillDir, 0755); err != nil {
-		return fmt.Errorf("failed to create skills directory: %w", err)
-	}
-
-	skillContent := `# CCC Send - File Transfer Skill
-
-## Description
-Send files to the user via Telegram using the ccc send command.
-
-## Usage
-When the user asks you to send them a file, or when you have generated/built a file that the user needs (like an APK, binary, or any other file), use this command:
-
-` + "```bash" + `
-ccc send <file_path>
-` + "```" + `
-
-## How it works
-- **Small files (< 50MB)**: Sent directly via Telegram
-- **Large files (≥ 50MB)**: Streamed via relay server with a one-time download link
-
-## Examples
-
-### Send a built APK
-` + "```bash" + `
-ccc send ./build/app.apk
-` + "```" + `
-
-### Send a generated file
-` + "```bash" + `
-ccc send ./output/report.pdf
-` + "```" + `
-
-### Send from subdirectory
-` + "```bash" + `
-ccc send ~/Downloads/large-file.zip
-` + "```" + `
-
-## Important Notes
-- The command detects the current session from your working directory
-- For large files, the command will wait up to 10 minutes for the user to download
-- Each download link is one-time use only
-- Use this proactively when you've created files the user needs!
-`
-
-	if err := os.WriteFile(skillPath, []byte(skillContent), 0644); err != nil {
-		return fmt.Errorf("failed to write skill file: %w", err)
-	}
-
-	fmt.Println("✅ CCC send skill installed!")
-	return nil
-}
-
-func uninstallSkill() error {
-	home, _ := os.UserHomeDir()
-	skillPath := filepath.Join(home, ".claude", "skills", "ccc-send.md")
-	os.Remove(skillPath)
-	return nil
-}
-
-// truncate shortens a string to n characters
-func truncate(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	return s[:n] + "..."
-}
-
-// hookLog writes debug log entries
-func hookLog(format string, args ...interface{}) {
-	f, err := os.OpenFile("/tmp/ccc-hook-debug.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-	if err != nil {
-		return
-	}
-	defer f.Close()
-	fmt.Fprintf(f, "[%s] %s\n", time.Now().Format("15:04:05"), fmt.Sprintf(format, args...))
+// removeProjectHooks removes the .claude/settings.local.json we created
+func removeProjectHooks(workDir string) {
+	settingsPath := filepath.Join(workDir, ".claude", "settings.local.json")
+	os.Remove(settingsPath)
 }
