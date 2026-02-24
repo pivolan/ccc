@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(go build:*)",
+      "WebSearch",
+      "WebFetch(domain:docs.claude.com)",
+      "Bash(git remote:*)",
+      "Bash(git add:*)"
+    ]
+  }
+}

@@ -2,11 +2,10 @@ package main
 
 import (
 	"encoding/json"
-	"os"
-	"path/filepath"
 	"testing"
 )
 
+<<<<<<< HEAD
 // TestSessionName tests the sessionName function
 func TestSessionName(t *testing.T) {
 	tests := []struct {
@@ -344,6 +343,8 @@ func TestExtractLastTurnEmptyPath(t *testing.T) {
 	}
 }
 
+=======
+>>>>>>> bf46e03 (refactor: simplify architecture, remove external dependencies)
 // TestExecuteCommand tests the executeCommand function
 func TestExecuteCommand(t *testing.T) {
 	tests := []struct {
@@ -372,16 +373,11 @@ func TestExecuteCommand(t *testing.T) {
 	}
 }
 
-// TestConfigJSON tests JSON marshaling/unmarshaling
+// TestConfigJSON tests JSON marshaling of Config
 func TestConfigJSON(t *testing.T) {
 	config := &Config{
 		BotToken: "token123",
 		ChatID:   12345,
-		GroupID:  -67890,
-		Sessions: map[string]*SessionInfo{
-			"test": {TopicID: 100, Path: "/home/user/test"},
-		},
-		Away: true,
 	}
 
 	data, err := json.Marshal(config)
@@ -397,25 +393,8 @@ func TestConfigJSON(t *testing.T) {
 	if loaded.BotToken != config.BotToken {
 		t.Errorf("BotToken mismatch")
 	}
-}
-
-// TestHookDataJSON tests HookData JSON parsing
-func TestHookDataJSON(t *testing.T) {
-	jsonStr := `{"cwd":"/Users/test/project","transcript_path":"/tmp/transcript.jsonl","session_id":"abc123"}`
-
-	var hookData HookData
-	if err := json.Unmarshal([]byte(jsonStr), &hookData); err != nil {
-		t.Fatalf("Unmarshal failed: %v", err)
-	}
-
-	if hookData.Cwd != "/Users/test/project" {
-		t.Errorf("Cwd = %q, want %q", hookData.Cwd, "/Users/test/project")
-	}
-	if hookData.TranscriptPath != "/tmp/transcript.jsonl" {
-		t.Errorf("TranscriptPath = %q, want %q", hookData.TranscriptPath, "/tmp/transcript.jsonl")
-	}
-	if hookData.SessionID != "abc123" {
-		t.Errorf("SessionID = %q, want %q", hookData.SessionID, "abc123")
+	if loaded.ChatID != config.ChatID {
+		t.Errorf("ChatID mismatch")
 	}
 }
 
@@ -423,8 +402,7 @@ func TestHookDataJSON(t *testing.T) {
 func TestTelegramMessageJSON(t *testing.T) {
 	jsonStr := `{
 		"message_id": 123,
-		"message_thread_id": 456,
-		"chat": {"id": 789, "type": "supergroup"},
+		"chat": {"id": 789, "type": "private"},
 		"from": {"id": 111, "username": "testuser"},
 		"text": "Hello world"
 	}`
@@ -437,14 +415,11 @@ func TestTelegramMessageJSON(t *testing.T) {
 	if msg.MessageID != 123 {
 		t.Errorf("MessageID = %d, want 123", msg.MessageID)
 	}
-	if msg.MessageThreadID != 456 {
-		t.Errorf("MessageThreadID = %d, want 456", msg.MessageThreadID)
-	}
 	if msg.Chat.ID != 789 {
 		t.Errorf("Chat.ID = %d, want 789", msg.Chat.ID)
 	}
-	if msg.Chat.Type != "supergroup" {
-		t.Errorf("Chat.Type = %q, want supergroup", msg.Chat.Type)
+	if msg.Chat.Type != "private" {
+		t.Errorf("Chat.Type = %q, want private", msg.Chat.Type)
 	}
 	if msg.From.Username != "testuser" {
 		t.Errorf("From.Username = %q, want testuser", msg.From.Username)
@@ -454,138 +429,26 @@ func TestTelegramMessageJSON(t *testing.T) {
 	}
 }
 
-// TestMessageTruncation tests that long messages are truncated
-func TestMessageTruncation(t *testing.T) {
-	// The sendMessage function truncates at 4000 chars
-	// We test the truncation logic directly
-	const maxLen = 4000
-
+// TestSplitMessage tests message splitting logic
+func TestSplitMessage(t *testing.T) {
 	tests := []struct {
-		name       string
-		inputLen   int
-		shouldTrim bool
+		name     string
+		text     string
+		maxLen   int
+		expected int // number of parts
 	}{
-		{"short message", 100, false},
-		{"exactly max", maxLen, false},
-		{"over max", maxLen + 100, true},
-		{"way over max", 10000, true},
+		{"short", "hello", 100, 1},
+		{"exact", "hello", 5, 1},
+		{"split needed", "hello world foo bar", 10, 2},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			// Create message of specified length
-			text := make([]byte, tt.inputLen)
-			for i := range text {
-				text[i] = 'a'
-			}
-			msg := string(text)
-
-			// Apply same truncation logic as sendMessage
-			if len(msg) > maxLen {
-				msg = msg[:maxLen] + "\n... (truncated)"
-			}
-
-			if tt.shouldTrim {
-				if len(msg) <= tt.inputLen {
-					// Should have been truncated
-					if len(msg) != maxLen+len("\n... (truncated)") {
-						t.Errorf("truncated length = %d, want %d", len(msg), maxLen+len("\n... (truncated)"))
-					}
-				}
-			} else {
-				if len(msg) != tt.inputLen {
-					t.Errorf("message was unexpectedly modified")
-				}
+			parts := splitMessage(tt.text, tt.maxLen)
+			if len(parts) != tt.expected {
+				t.Errorf("splitMessage(%q, %d) returned %d parts, want %d", tt.text, tt.maxLen, len(parts), tt.expected)
 			}
 		})
-	}
-}
-
-// TestListTmuxSessionsParsing tests the session list parsing logic
-func TestListTmuxSessionsParsing(t *testing.T) {
-	// Test the parsing logic that filters claude- prefixed sessions
-	testData := []struct {
-		sessionName string
-		shouldMatch bool
-	}{
-		{"claude-myproject", true},
-		{"claude-money/shop", true},
-		{"other-session", false},
-		{"claude-", true},
-		{"notclaude-test", false},
-	}
-
-	for _, tt := range testData {
-		t.Run(tt.sessionName, func(t *testing.T) {
-			hasPrefix := len(tt.sessionName) >= 7 && tt.sessionName[:7] == "claude-"
-			if hasPrefix != tt.shouldMatch {
-				t.Errorf("prefix check for %q = %v, want %v", tt.sessionName, hasPrefix, tt.shouldMatch)
-			}
-		})
-	}
-}
-
-// TestConfigFilePermissions tests that config is saved with correct permissions
-func TestConfigFilePermissions(t *testing.T) {
-	tmpDir, err := os.MkdirTemp("", "ccc-test-*")
-	if err != nil {
-		t.Fatalf("Failed to create temp dir: %v", err)
-	}
-	defer os.RemoveAll(tmpDir)
-
-	originalHome := os.Getenv("HOME")
-	os.Setenv("HOME", tmpDir)
-	defer os.Setenv("HOME", originalHome)
-
-	config := &Config{
-		BotToken: "secret-token",
-		ChatID:   12345,
-		Sessions: make(map[string]*SessionInfo),
-	}
-
-	if err := saveConfig(config); err != nil {
-		t.Fatalf("saveConfig failed: %v", err)
-	}
-
-	configPath := filepath.Join(tmpDir, ".ccc.json")
-	info, err := os.Stat(configPath)
-	if err != nil {
-		t.Fatalf("Failed to stat config file: %v", err)
-	}
-
-	// Check permissions are 0600 (owner read/write only)
-	perm := info.Mode().Perm()
-	if perm != 0600 {
-		t.Errorf("Config file permissions = %o, want 0600", perm)
-	}
-}
-
-// TestEmptySessionsMap tests behavior with empty sessions
-func TestEmptySessionsMap(t *testing.T) {
-	config := &Config{
-		Sessions: make(map[string]*SessionInfo),
-	}
-
-	result := getSessionByTopic(config, 100)
-	if result != "" {
-		t.Errorf("getSessionByTopic with empty sessions = %q, want empty", result)
-	}
-}
-
-// TestTopicResultJSON tests TopicResult JSON parsing
-func TestTopicResultJSON(t *testing.T) {
-	jsonStr := `{"message_thread_id": 12345, "name": "test-topic"}`
-
-	var topic TopicResult
-	if err := json.Unmarshal([]byte(jsonStr), &topic); err != nil {
-		t.Fatalf("Unmarshal failed: %v", err)
-	}
-
-	if topic.MessageThreadID != 12345 {
-		t.Errorf("MessageThreadID = %d, want 12345", topic.MessageThreadID)
-	}
-	if topic.Name != "test-topic" {
-		t.Errorf("Name = %q, want test-topic", topic.Name)
 	}
 }
 
@@ -660,11 +523,6 @@ func TestReplyToMessage(t *testing.T) {
 
 // Helper function
 func contains(s, substr string) bool {
-	return len(s) >= len(substr) && (s == substr || len(substr) == 0 ||
-		(len(s) > 0 && len(substr) > 0 && findSubstring(s, substr)))
-}
-
-func findSubstring(s, substr string) bool {
 	for i := 0; i <= len(s)-len(substr); i++ {
 		if s[i:i+len(substr)] == substr {
 			return true

@@ -1,10 +1,12 @@
+<<<<<<< HEAD
 .PHONY: build build-voice install install-voice clean deps
+=======
+.PHONY: build install clean
+>>>>>>> bf46e03 (refactor: simplify architecture, remove external dependencies)
 
-PREFIX := $(CURDIR)/build/whisper
-BUILD_DIR := $(CURDIR)/build/cmake
 UNAME := $(shell uname)
-PC_DIR := $(PREFIX)/lib/pkgconfig
 
+<<<<<<< HEAD
 # Default build: no voice/whisper support (works on all platforms)
 build:
 	go build -o ccc
@@ -41,6 +43,10 @@ deps:
 build-voice: deps
 	PKG_CONFIG_PATH="$(PC_DIR)" CGO_LDFLAGS_ALLOW="-(W|D).*" \
 		go build -tags voice -o ccc
+=======
+build:
+	go build -o ccc
+>>>>>>> bf46e03 (refactor: simplify architecture, remove external dependencies)
 	@if [ "$(UNAME)" = "Darwin" ]; then \
 		codesign -f -s - ccc 2>/dev/null || true; \
 	fi

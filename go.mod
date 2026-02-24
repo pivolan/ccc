@@ -1,6 +1,7 @@
 module github.com/kidandcat/ccc
 
 go 1.24.0
+<<<<<<< HEAD
 
 require github.com/mutablelogic/go-whisper v0.0.39
 
@@ -64,3 +65,5 @@ require (
 	google.golang.org/protobuf v1.36.11 // indirect
 	rsc.io/qr v0.2.0 // indirect
 )
+=======
+>>>>>>> bf46e03 (refactor: simplify architecture, remove external dependencies)

@@ -7,17 +7,15 @@ import (
 	"strings"
 )
 
+<<<<<<< HEAD
 const version = "1.6.2"
+=======
+const version = "2.0.0"
+>>>>>>> bf46e03 (refactor: simplify architecture, remove external dependencies)
 
-// SessionInfo stores information about a session
-type SessionInfo struct {
-	TopicID         int64  `json:"topic_id"`
-	Path            string `json:"path"`
-	ClaudeSessionID string `json:"claude_session_id,omitempty"`
-}
-
-// Config stores bot configuration and session mappings
+// Config stores bot configuration (in-memory only, no persistence)
 type Config struct {
+<<<<<<< HEAD
 	BotToken         string                  `json:"bot_token"`
 	ChatID           int64                   `json:"chat_id"`                     // Private chat for simple commands
 	GroupID          int64                   `json:"group_id,omitempty"`          // Group with topics for sessions
@@ -28,26 +26,30 @@ type Config struct {
 	Away             bool                    `json:"away"`
 	OAuthToken       string                  `json:"oauth_token,omitempty"`
 	OTPSecret        string                  `json:"otp_secret,omitempty"`        // TOTP secret for safe mode
+=======
+	BotToken        string
+	ChatID          int64
+	SkipPermissions bool
+>>>>>>> bf46e03 (refactor: simplify architecture, remove external dependencies)
 }
 
 // TelegramMessage represents a Telegram message
 type TelegramMessage struct {
-	MessageID       int    `json:"message_id"`
-	MessageThreadID int64  `json:"message_thread_id,omitempty"` // Topic ID
-	Chat            struct {
+	MessageID int   `json:"message_id"`
+	Chat      struct {
 		ID   int64  `json:"id"`
-		Type string `json:"type"` // "private", "group", "supergroup"
+		Type string `json:"type"`
 	} `json:"chat"`
 	From struct {
 		ID       int64  `json:"id"`
 		Username string `json:"username"`
 	} `json:"from"`
-	Text           string           `json:"text"`
-	ReplyToMessage *TelegramMessage `json:"reply_to_message,omitempty"`
-	Voice          *TelegramVoice   `json:"voice,omitempty"`
-	Photo          []TelegramPhoto  `json:"photo,omitempty"`
+	Text           string            `json:"text"`
+	ReplyToMessage *TelegramMessage  `json:"reply_to_message,omitempty"`
+	Voice          *TelegramVoice    `json:"voice,omitempty"`
+	Photo          []TelegramPhoto   `json:"photo,omitempty"`
 	Document       *TelegramDocument `json:"document,omitempty"`
-	Caption        string           `json:"caption,omitempty"`
+	Caption        string            `json:"caption,omitempty"`
 }
 
 type TelegramVoice struct {
@@ -68,25 +70,25 @@ type TelegramDocument struct {
 	FileSize int    `json:"file_size"`
 }
 
-// CallbackQuery represents a Telegram callback query (button press)
-type CallbackQuery struct {
-	ID   string `json:"id"`
-	From struct {
-		ID int64 `json:"id"`
-	} `json:"from"`
-	Message *TelegramMessage `json:"message"`
-	Data    string           `json:"data"`
-}
-
 // TelegramUpdate represents an update from Telegram
 type TelegramUpdate struct {
 	OK          bool   `json:"ok"`
 	Description string `json:"description"`
 	Result      []struct {
-		UpdateID      int             `json:"update_id"`
-		Message       TelegramMessage `json:"message"`
-		CallbackQuery *CallbackQuery  `json:"callback_query"`
+		UpdateID      int              `json:"update_id"`
+		Message       TelegramMessage  `json:"message"`
+		CallbackQuery *CallbackQuery   `json:"callback_query,omitempty"`
 	} `json:"result"`
+}
+
+// CallbackQuery represents a callback from inline keyboard button
+type CallbackQuery struct {
+	ID   string          `json:"id"`
+	From struct {
+		ID int64 `json:"id"`
+	} `json:"from"`
+	Message *TelegramMessage `json:"message,omitempty"`
+	Data    string           `json:"data"`
 }
 
 // TelegramResponse represents a response from Telegram API
@@ -96,6 +98,7 @@ type TelegramResponse struct {
 	Result      json.RawMessage `json:"result,omitempty"`
 }
 
+<<<<<<< HEAD
 // TopicResult represents the result of creating a forum topic
 type TopicResult struct {
 	MessageThreadID int64  `json:"message_thread_id"`
@@ -152,12 +155,13 @@ type InlineKeyboardButton struct {
 	CallbackData string `json:"callback_data"`
 }
 
+=======
+>>>>>>> bf46e03 (refactor: simplify architecture, remove external dependencies)
 func init() {
 	initPaths()
 }
 
 func main() {
-	// Handle flags
 	if len(os.Args) > 1 {
 		switch os.Args[1] {
 		case "-h", "--help", "help":
@@ -169,43 +173,45 @@ func main() {
 		}
 	}
 
-	if len(os.Args) < 2 {
-		// No args: start/attach tmux session with topic
-		if err := startSession(false); err != nil {
-			os.Exit(1)
+	if len(os.Args) >= 2 {
+		switch os.Args[1] {
+		case "hook-stop":
+			handleStopHook()
+			return
+		case "hook-notification":
+			handleNotificationHook()
+			return
+		case "hook-permission":
+			handlePermissionHook()
+			return
 		}
-		return
 	}
 
-	// Check for -c flag (continue) as first arg
-	if os.Args[1] == "-c" {
-		if err := startSession(true); err != nil {
-			os.Exit(1)
+	// Parse remaining args: token and optional flags
+	var token string
+	skipPerms := false
+	for _, arg := range os.Args[1:] {
+		if arg == "--yolo" {
+			skipPerms = true
+		} else if !strings.HasPrefix(arg, "-") {
+			token = arg
 		}
-		return
 	}
 
-	switch os.Args[1] {
-	case "run":
-		// Run claude directly (used inside tmux sessions)
-		continueSession := len(os.Args) > 2 && os.Args[2] == "-c"
-		if err := runClaudeRaw(continueSession); err != nil {
-			os.Exit(1)
-		}
-		return
-	case "setup":
-		if len(os.Args) < 3 {
-			fmt.Println("Usage: ccc setup <bot_token>")
-			os.Exit(1)
-		}
-		if err := setup(os.Args[2]); err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			os.Exit(1)
-		}
+	if token == "" {
+		printHelp()
+		os.Exit(1)
+	}
 
-	case "doctor":
-		doctor()
+	fmt.Println("Send any message to your bot in Telegram...")
+	chatID, err := waitForFirstMessage(token)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("Connected! Chat ID: %d\n", chatID)
 
+<<<<<<< HEAD
 	case "config":
 		config, err := loadConfig()
 		if err != nil {
@@ -407,5 +413,33 @@ func main() {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}
+=======
+	config := &Config{BotToken: token, ChatID: chatID, SkipPermissions: skipPerms}
+	if err := run(config); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+>>>>>>> bf46e03 (refactor: simplify architecture, remove external dependencies)
 	}
+}
+
+func printHelp() {
+	fmt.Printf(`ccc - Claude Code Companion v%s
+
+USAGE:
+    ccc <bot_token>         Start bot (creates tmux + Claude, polls Telegram)
+    ccc <bot_token> --yolo  Start with auto-accept all permissions
+
+FLAGS:
+    -h, --help              Show this help
+    -v, --version           Show version
+    --yolo                  Skip all Claude permission prompts
+
+TELEGRAM COMMANDS:
+    /c <cmd>                Execute shell command
+    /restart                Restart Claude session
+    /stats                  Show system stats
+    /version                Show version
+
+For more info: https://github.com/kidandcat/ccc
+`, version)
 }
