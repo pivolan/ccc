@@ -456,7 +456,9 @@ func isToolResult(content json.RawMessage) bool {
 	return false
 }
 
-// installProjectHooks writes .claude/settings.local.json in workDir with Stop and Notification hooks
+// installProjectHooks writes .claude/settings.local.json in workDir with Stop and Notification hooks.
+// When SkipPermissions (YOLO mode) is enabled, the PreToolUse permission hook is omitted
+// and any leftover permission IPC files are cleaned up.
 func installProjectHooks(workDir string, config *Config) error {
 	claudeDir := filepath.Join(workDir, ".claude")
 	if err := os.MkdirAll(claudeDir, 0755); err != nil {
@@ -470,39 +472,48 @@ func installProjectHooks(workDir string, config *Config) error {
 
 	hookArgs := fmt.Sprintf(" --token=%s --chat-id=%d", config.BotToken, config.ChatID)
 
-	settings := map[string]interface{}{
-		"hooks": map[string]interface{}{
-			"PreToolUse": []interface{}{
-				map[string]interface{}{
-					"hooks": []interface{}{
-						map[string]interface{}{
-							"type":    "command",
-							"command": cccBin + " hook-permission" + hookArgs,
-						},
-					},
-				},
-			},
-			"Stop": []interface{}{
-				map[string]interface{}{
-					"hooks": []interface{}{
-						map[string]interface{}{
-							"type":    "command",
-							"command": cccBin + " hook-stop" + hookArgs,
-						},
-					},
-				},
-			},
-			"Notification": []interface{}{
-				map[string]interface{}{
-					"hooks": []interface{}{
-						map[string]interface{}{
-							"type":    "command",
-							"command": cccBin + " hook-notification" + hookArgs,
-						},
+	hooks := map[string]interface{}{
+		"Stop": []interface{}{
+			map[string]interface{}{
+				"hooks": []interface{}{
+					map[string]interface{}{
+						"type":    "command",
+						"command": cccBin + " hook-stop" + hookArgs,
 					},
 				},
 			},
 		},
+		"Notification": []interface{}{
+			map[string]interface{}{
+				"hooks": []interface{}{
+					map[string]interface{}{
+						"type":    "command",
+						"command": cccBin + " hook-notification" + hookArgs,
+					},
+				},
+			},
+		},
+	}
+
+	// Only register PreToolUse permission hook when NOT in YOLO mode
+	if !config.SkipPermissions {
+		hooks["PreToolUse"] = []interface{}{
+			map[string]interface{}{
+				"hooks": []interface{}{
+					map[string]interface{}{
+						"type":    "command",
+						"command": cccBin + " hook-permission" + hookArgs,
+					},
+				},
+			},
+		}
+	} else {
+		// YOLO mode: clean up leftover permission IPC files
+		cleanupPermissions()
+	}
+
+	settings := map[string]interface{}{
+		"hooks": hooks,
 	}
 
 	data, err := json.MarshalIndent(settings, "", "  ")
@@ -511,6 +522,11 @@ func installProjectHooks(workDir string, config *Config) error {
 	}
 
 	return os.WriteFile(filepath.Join(claudeDir, "settings.local.json"), data, 0600)
+}
+
+// cleanupPermissions removes the permission IPC directory and always-allow file
+func cleanupPermissions() {
+	os.RemoveAll(permissionsDir)
 }
 
 // removeProjectHooks removes the .claude/settings.local.json we created

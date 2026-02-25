@@ -5,7 +5,9 @@
       "WebSearch",
       "WebFetch(domain:docs.claude.com)",
       "Bash(git remote:*)",
-      "Bash(git add:*)"
+      "Bash(git add:*)",
+      "Bash(ls:*)",
+      "Bash(go test:*)"
     ]
   }
 }
