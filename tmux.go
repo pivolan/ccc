@@ -77,6 +77,19 @@ func createTmuxSession(name string, workDir string, config *Config) error {
 	if config.SkipPermissions {
 		launchCmd += " --dangerously-skip-permissions"
 	}
+
+	// Inject system prompt so Claude knows how to send files/messages to Telegram
+	cccBin, _ := os.Executable()
+	if cccBin == "" {
+		cccBin = "ccc"
+	}
+	systemPrompt := fmt.Sprintf(
+		`To send files, photos, videos, or text messages to the user via Telegram, run: %s tg-send --token=%s --chat-id=%d [--caption=text] <file_path_or_text_message>. `+
+			`Photo extensions (jpg/jpeg/png/gif/webp) are sent as photos, video extensions (mp4/mov/avi/mkv) as videos, other files as documents. `+
+			`If the argument is not a file path, it is sent as a text message.`,
+		cccBin, config.BotToken, config.ChatID,
+	)
+	launchCmd += fmt.Sprintf(` --append-system-prompt '%s'`, strings.ReplaceAll(systemPrompt, `'`, `'\''`))
 	if proxy := os.Getenv("HTTPS_PROXY"); proxy == "" {
 		proxy = os.Getenv("https_proxy")
 		if proxy != "" {

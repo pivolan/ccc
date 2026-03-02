@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 )
 
@@ -108,6 +110,15 @@ func main() {
 		case "hook-permission":
 			handlePermissionHook()
 			return
+		case "hook-pretooluse":
+			handlePreToolUseHook()
+			return
+		case "hook-posttooluse":
+			handlePostToolUseHook()
+			return
+		case "tg-send":
+			handleTgSend()
+			return
 		}
 	}
 
@@ -142,12 +153,78 @@ func main() {
 	}
 }
 
+var photoExtensions = map[string]bool{
+	".jpg": true, ".jpeg": true, ".png": true, ".gif": true, ".webp": true,
+}
+
+var videoExtensions = map[string]bool{
+	".mp4": true, ".mov": true, ".avi": true, ".mkv": true,
+}
+
+func handleTgSend() {
+	var token, chatStr, caption, target string
+	for _, arg := range os.Args[2:] {
+		if strings.HasPrefix(arg, "--token=") {
+			token = strings.TrimPrefix(arg, "--token=")
+		} else if strings.HasPrefix(arg, "--chat-id=") {
+			chatStr = strings.TrimPrefix(arg, "--chat-id=")
+		} else if strings.HasPrefix(arg, "--caption=") {
+			caption = strings.TrimPrefix(arg, "--caption=")
+		} else if !strings.HasPrefix(arg, "-") {
+			target = arg
+		}
+	}
+
+	if token == "" || chatStr == "" || target == "" {
+		fmt.Fprintln(os.Stderr, "Usage: ccc tg-send --token=TOKEN --chat-id=CHATID [--caption=TEXT] <file_or_message>")
+		os.Exit(1)
+	}
+
+	chatID, err := strconv.ParseInt(chatStr, 10, 64)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Invalid chat-id: %s\n", chatStr)
+		os.Exit(1)
+	}
+
+	config := &Config{BotToken: token, ChatID: chatID}
+
+	// Check if target is a file
+	if info, err := os.Stat(target); err == nil && !info.IsDir() {
+		ext := strings.ToLower(filepath.Ext(target))
+		if photoExtensions[ext] {
+			err = sendPhoto(config, chatID, target, caption)
+		} else if videoExtensions[ext] {
+			err = sendVideo(config, chatID, target, caption)
+		} else {
+			err = sendFile(config, chatID, target, caption)
+		}
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error sending file: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println("File sent successfully")
+		return
+	}
+
+	// Otherwise treat target as text message
+	text := target
+	if caption != "" {
+		text = caption + "\n\n" + target
+	}
+	if err := sendMessage(config, chatID, text); err != nil {
+		fmt.Fprintf(os.Stderr, "Error sending message: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Println("Message sent successfully")
+}
+
 func printHelp() {
 	fmt.Printf(`ccc - Claude Code Companion v%s
 
 USAGE:
     ccc <bot_token>         Start bot (creates tmux + Claude, polls Telegram)
     ccc <bot_token> --yolo  Start with auto-accept all permissions
+    ccc tg-send             Send file/message to Telegram (used by Claude)
 
 FLAGS:
     -h, --help              Show this help
@@ -159,6 +236,9 @@ TELEGRAM COMMANDS:
     /restart                Restart Claude session
     /stats                  Show system stats
     /version                Show version
+
+TG-SEND:
+    ccc tg-send --token=TOKEN --chat-id=CHATID [--caption=TEXT] <file_or_message>
 
 For more info: https://github.com/kidandcat/ccc
 `, version)

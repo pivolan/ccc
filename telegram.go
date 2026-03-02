@@ -122,6 +122,36 @@ func splitMessage(text string, maxLen int) []string {
 	return messages
 }
 
+func sendMessageGetID(config *Config, chatID int64, text string) (int, error) {
+	params := url.Values{
+		"chat_id":    {fmt.Sprintf("%d", chatID)},
+		"text":       {text},
+		"parse_mode": {"Markdown"},
+	}
+	result, err := telegramAPI(config, "sendMessage", params)
+	if err != nil {
+		return 0, err
+	}
+	if !result.OK {
+		params = url.Values{
+			"chat_id": {fmt.Sprintf("%d", chatID)},
+			"text":    {text},
+		}
+		result, err = telegramAPI(config, "sendMessage", params)
+		if err != nil {
+			return 0, err
+		}
+		if !result.OK {
+			return 0, fmt.Errorf("telegram error: %s", result.Description)
+		}
+	}
+	var msg struct {
+		MessageID int `json:"message_id"`
+	}
+	json.Unmarshal(result.Result, &msg)
+	return msg.MessageID, nil
+}
+
 func sendMessageWithKeyboard(config *Config, chatID int64, text string, keyboard interface{}) (int, error) {
 	kbJSON, err := json.Marshal(keyboard)
 	if err != nil {
@@ -155,6 +185,13 @@ func answerCallbackQuery(config *Config, callbackID string) {
 	})
 }
 
+func deleteMessage(config *Config, chatID int64, messageID int) {
+	telegramAPI(config, "deleteMessage", url.Values{
+		"chat_id":    {fmt.Sprintf("%d", chatID)},
+		"message_id": {fmt.Sprintf("%d", messageID)},
+	})
+}
+
 func editMessageReplyMarkup(config *Config, chatID int64, messageID int) {
 	telegramAPI(config, "editMessageReplyMarkup", url.Values{
 		"chat_id":      {fmt.Sprintf("%d", chatID)},
@@ -164,6 +201,18 @@ func editMessageReplyMarkup(config *Config, chatID int64, messageID int) {
 }
 
 func sendFile(config *Config, chatID int64, filePath string, caption string) error {
+	return sendFileMultipart(config, chatID, filePath, caption, "document", "sendDocument")
+}
+
+func sendPhoto(config *Config, chatID int64, filePath string, caption string) error {
+	return sendFileMultipart(config, chatID, filePath, caption, "photo", "sendPhoto")
+}
+
+func sendVideo(config *Config, chatID int64, filePath string, caption string) error {
+	return sendFileMultipart(config, chatID, filePath, caption, "video", "sendVideo")
+}
+
+func sendFileMultipart(config *Config, chatID int64, filePath string, caption string, fieldName string, apiMethod string) error {
 	file, err := os.Open(filePath)
 	if err != nil {
 		return err
@@ -178,7 +227,7 @@ func sendFile(config *Config, chatID int64, filePath string, caption string) err
 		writer.WriteField("caption", caption)
 	}
 
-	part, err := writer.CreateFormFile("document", filepath.Base(filePath))
+	part, err := writer.CreateFormFile(fieldName, filepath.Base(filePath))
 	if err != nil {
 		return err
 	}
@@ -186,7 +235,7 @@ func sendFile(config *Config, chatID int64, filePath string, caption string) err
 	writer.Close()
 
 	resp, err := http.Post(
-		fmt.Sprintf("https://api.telegram.org/bot%s/sendDocument", config.BotToken),
+		fmt.Sprintf("https://api.telegram.org/bot%s/%s", config.BotToken, apiMethod),
 		writer.FormDataContentType(),
 		body,
 	)
@@ -238,6 +287,42 @@ func downloadTelegramFile(config *Config, fileID string, destPath string) error 
 
 	_, err = io.Copy(out, fileResp.Body)
 	return err
+}
+
+func sendChatAction(config *Config, chatID int64, action string) {
+	telegramAPI(config, "sendChatAction", url.Values{
+		"chat_id": {fmt.Sprintf("%d", chatID)},
+		"action":  {action},
+	})
+}
+
+func editMessageText(config *Config, chatID int64, messageID int, text string) error {
+	params := url.Values{
+		"chat_id":    {fmt.Sprintf("%d", chatID)},
+		"message_id": {fmt.Sprintf("%d", messageID)},
+		"text":       {text},
+		"parse_mode": {"Markdown"},
+	}
+	result, err := telegramAPI(config, "editMessageText", params)
+	if err != nil {
+		return err
+	}
+	if !result.OK {
+		// Retry without markdown
+		params = url.Values{
+			"chat_id":    {fmt.Sprintf("%d", chatID)},
+			"message_id": {fmt.Sprintf("%d", messageID)},
+			"text":       {text},
+		}
+		result, err = telegramAPI(config, "editMessageText", params)
+		if err != nil {
+			return err
+		}
+		if !result.OK {
+			return fmt.Errorf("telegram error: %s", result.Description)
+		}
+	}
+	return nil
 }
 
 func setBotCommands(botToken string) {

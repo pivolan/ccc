@@ -162,7 +162,13 @@ func listen(config *Config, workDir string) error {
 						}
 						prompt := fmt.Sprintf("%s %s", caption, imgPath)
 						sendMessage(config, chatID, "Image saved, sending to Claude...")
+						clearProgress()
+						stopTyping := startTypingLoop(config, chatID)
 						sendToTmuxWithDelay(tmuxSessionName(), prompt, 2*time.Second)
+						go func() {
+							time.Sleep(10 * time.Second)
+							stopTyping()
+						}()
 					}
 				}
 				continue
@@ -183,7 +189,13 @@ func listen(config *Config, workDir string) error {
 							caption = fmt.Sprintf("%s\n\nFile: %s", caption, destPath)
 						}
 						sendMessage(config, chatID, fmt.Sprintf("File saved: %s", destPath))
+						clearProgress()
+						stopTyping := startTypingLoop(config, chatID)
 						sendToTmux(tmuxSessionName(), caption)
+						go func() {
+							time.Sleep(10 * time.Second)
+							stopTyping()
+						}()
 					}
 				}
 				continue
@@ -220,6 +232,7 @@ func listen(config *Config, workDir string) error {
 
 			switch text {
 			case "/restart":
+				clearProgress()
 				sendMessage(config, chatID, "Restarting Claude session...")
 				killTmuxSession(tmuxSessionName())
 				time.Sleep(500 * time.Millisecond)
@@ -243,8 +256,20 @@ func listen(config *Config, workDir string) error {
 			// Default: send text to tmux session
 			ensureTmuxSession(config, workDir)
 			if tmuxSessionExists(tmuxSessionName()) {
+				// Clear old progress state before sending new message
+				clearProgress()
+				// Start typing indicator loop (refreshes every 4s until Claude responds)
+				stopTyping := startTypingLoop(config, chatID)
 				if err := sendToTmux(tmuxSessionName(), text); err != nil {
+					stopTyping()
 					sendMessage(config, chatID, fmt.Sprintf("Failed to send: %v", err))
+				} else {
+					// Stop the typing loop after a short delay — PostToolUse hooks will
+					// re-send typing as Claude works, and StopHook finalizes everything
+					go func() {
+						time.Sleep(10 * time.Second)
+						stopTyping()
+					}()
 				}
 			} else {
 				sendMessage(config, chatID, "Failed to start tmux session")
@@ -284,6 +309,34 @@ func handleCallbackQuery(config *Config, cb *CallbackQuery) {
 		editMessageReplyMarkup(config, cb.Message.Chat.ID, cb.Message.MessageID)
 	}
 }
+
+// startTypingLoop sends "typing" action every 4 seconds until stop is called.
+// Returns a stop function.
+func startTypingLoop(config *Config, chatID int64) func() {
+	done := make(chan struct{})
+	go func() {
+		sendChatAction(config, chatID, "typing")
+		ticker := time.NewTicker(4 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-ticker.C:
+				sendChatAction(config, chatID, "typing")
+			}
+		}
+	}()
+	return func() {
+		select {
+		case <-done:
+		default:
+			close(done)
+		}
+	}
+}
+
+
 
 // ensureTmuxSession starts the tmux session if it doesn't exist
 func ensureTmuxSession(config *Config, workDir string) {

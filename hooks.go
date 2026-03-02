@@ -93,6 +93,14 @@ func handleStopHook() {
 
 	debugLog("transcriptPath: %s", hookData.TranscriptPath)
 
+	// Delete progress message — the final result replaces it
+	if state := loadProgress(); state != nil {
+		if state.MessageID != 0 {
+			deleteMessage(config, config.ChatID, state.MessageID)
+		}
+	}
+	clearProgress()
+
 	// Wait for transcript to be flushed to disk
 	time.Sleep(500 * time.Millisecond)
 
@@ -296,6 +304,258 @@ func handleNotificationHook() {
 	sendMessage(config, config.ChatID, strings.TrimSpace(text))
 }
 
+// handlePreToolUseHook sends a monitoring notification (no stdout = no blocking).
+// Registered always (alongside permission hook in non-YOLO mode).
+func handlePreToolUseHook() {
+	defer func() { recover() }()
+
+	config := configFromArgs()
+	if config == nil {
+		return
+	}
+
+	rawData, _ := readHookStdin()
+	if len(rawData) == 0 {
+		return
+	}
+
+	var hookData PermissionHookData
+	if json.Unmarshal(rawData, &hookData) != nil {
+		return
+	}
+
+	// Save transcript path so the polling goroutine can find it
+	if hookData.TranscriptPath != "" {
+		state := loadProgress()
+		if state == nil {
+			state = &progressState{}
+		}
+		if state.TranscriptPath != hookData.TranscriptPath {
+			state.TranscriptPath = hookData.TranscriptPath
+			saveProgress(state)
+		}
+	}
+
+	// Update status message with what Claude is about to do
+	desc := formatToolProgressLine(hookData.ToolName, hookData.ToolInput)
+	now := time.Now()
+	timeStr := now.Format("15:04:05")
+	var newLine string
+	if desc != "" {
+		newLine = fmt.Sprintf("`%s` → %s: %s", timeStr, hookData.ToolName, desc)
+	} else {
+		newLine = fmt.Sprintf("`%s` → %s", timeStr, hookData.ToolName)
+	}
+
+	state := loadProgress()
+	if state == nil {
+		state = &progressState{}
+	}
+
+	lines := strings.Split(state.Text, "\n")
+	if state.Text == "" {
+		lines = nil
+	}
+	lines = append(lines, newLine)
+	const maxLines = 5
+	if len(lines) > maxLines {
+		lines = lines[len(lines)-maxLines:]
+	}
+	newText := strings.Join(lines, "\n")
+
+	// Rate limit: only send/edit Telegram message if >= 3 seconds since last update
+	sinceLastUpdate := now.Unix() - state.UpdatedAt
+	if state.MessageID == 0 {
+		msgID, err := sendMessageGetID(config, config.ChatID, "⏳\n"+newText)
+		if err == nil {
+			state.MessageID = msgID
+		}
+		state.UpdatedAt = now.Unix()
+	} else if sinceLastUpdate >= 3 {
+		if editMessageText(config, config.ChatID, state.MessageID, "⏳\n"+newText) != nil {
+			oldMsgID := state.MessageID
+			msgID, err := sendMessageGetID(config, config.ChatID, "⏳\n"+newText)
+			if err == nil {
+				state.MessageID = msgID
+				deleteMessage(config, config.ChatID, oldMsgID)
+			}
+		}
+		state.UpdatedAt = now.Unix()
+	}
+	state.Text = newText
+	saveProgress(state)
+
+	sendChatAction(config, config.ChatID, "typing")
+	// No output to stdout — Claude continues without waiting
+}
+
+// PostToolUse hook data — same fields as PreToolUse
+type PostToolUseHookData struct {
+	SessionID      string          `json:"session_id"`
+	TranscriptPath string          `json:"transcript_path"`
+	Cwd            string          `json:"cwd"`
+	HookEventName  string          `json:"hook_event_name"`
+	ToolName       string          `json:"tool_name"`
+	ToolInput      json.RawMessage `json:"tool_input"`
+	ToolUseID      string          `json:"tool_use_id"`
+	ToolResponse   json.RawMessage `json:"tool_response,omitempty"`
+}
+
+const progressDir = "/tmp/ccc-progress"
+const progressFile = "/tmp/ccc-progress/status.json"
+
+type progressState struct {
+	MessageID      int    `json:"message_id"`
+	Text           string `json:"text"`
+	UpdatedAt      int64  `json:"updated_at"`
+	TranscriptPath string `json:"transcript_path,omitempty"`
+}
+
+func loadProgress() *progressState {
+	data, err := os.ReadFile(progressFile)
+	if err != nil {
+		return nil
+	}
+	var s progressState
+	if json.Unmarshal(data, &s) != nil {
+		return nil
+	}
+	return &s
+}
+
+func saveProgress(s *progressState) {
+	os.MkdirAll(progressDir, 0755)
+	data, _ := json.Marshal(s)
+	os.WriteFile(progressFile, data, 0644)
+}
+
+func clearProgress() {
+	os.Remove(progressFile)
+}
+
+func handlePostToolUseHook() {
+	defer func() { recover() }()
+
+	config := configFromArgs()
+	if config == nil {
+		return
+	}
+
+	rawData, _ := readHookStdin()
+	if len(rawData) == 0 {
+		return
+	}
+
+	var hookData PostToolUseHookData
+	if json.Unmarshal(rawData, &hookData) != nil {
+		return
+	}
+
+	// Build a short progress line for this tool
+	desc := formatToolProgressLine(hookData.ToolName, hookData.ToolInput)
+	now := time.Now()
+	timeStr := now.Format("15:04:05")
+	var newLine string
+	if desc != "" {
+		newLine = fmt.Sprintf("`%s` ✓ %s: %s", timeStr, hookData.ToolName, desc)
+	} else {
+		newLine = fmt.Sprintf("`%s` ✓ %s", timeStr, hookData.ToolName)
+	}
+
+	state := loadProgress()
+	if state == nil {
+		state = &progressState{}
+	}
+	if hookData.TranscriptPath != "" {
+		state.TranscriptPath = hookData.TranscriptPath
+	}
+
+	lines := strings.Split(state.Text, "\n")
+	if state.Text == "" {
+		lines = nil
+	}
+	lines = append(lines, newLine)
+	const maxLines = 5
+	if len(lines) > maxLines {
+		lines = lines[len(lines)-maxLines:]
+	}
+	newText := strings.Join(lines, "\n")
+
+	// Rate limit: only send/edit Telegram message if >= 3 seconds since last update
+	sinceLastUpdate := now.Unix() - state.UpdatedAt
+	if state.MessageID == 0 {
+		msgID, err := sendMessageGetID(config, config.ChatID, "⏳\n"+newText)
+		if err == nil {
+			state.MessageID = msgID
+		}
+		state.UpdatedAt = now.Unix()
+	} else if sinceLastUpdate >= 3 {
+		if editMessageText(config, config.ChatID, state.MessageID, "⏳\n"+newText) != nil {
+			oldMsgID := state.MessageID
+			msgID, err := sendMessageGetID(config, config.ChatID, "⏳\n"+newText)
+			if err == nil {
+				state.MessageID = msgID
+				deleteMessage(config, config.ChatID, oldMsgID)
+			}
+		}
+		state.UpdatedAt = now.Unix()
+	}
+	state.Text = newText
+	saveProgress(state)
+
+	sendChatAction(config, config.ChatID, "typing")
+}
+
+func formatToolProgressLine(toolName string, toolInput json.RawMessage) string {
+	var input map[string]interface{}
+	if json.Unmarshal(toolInput, &input) != nil {
+		return ""
+	}
+	switch toolName {
+	case "Bash":
+		if cmd, ok := input["command"].(string); ok {
+			// Show first line of command, truncated
+			lines := strings.SplitN(cmd, "\n", 2)
+			s := strings.TrimSpace(lines[0])
+			if len(s) > 80 {
+				s = s[:80] + "…"
+			}
+			return fmt.Sprintf("`%s`", s)
+		}
+	case "Write", "Edit", "MultiEdit":
+		if fp, ok := input["file_path"].(string); ok {
+			return fp
+		}
+	case "Read":
+		if fp, ok := input["file_path"].(string); ok {
+			return fp
+		}
+	case "Glob":
+		if p, ok := input["pattern"].(string); ok {
+			return p
+		}
+	case "Grep":
+		if p, ok := input["pattern"].(string); ok {
+			return p
+		}
+	case "Task":
+		if desc, ok := input["description"].(string); ok {
+			if len(desc) > 60 {
+				desc = desc[:60] + "…"
+			}
+			return desc
+		}
+	case "WebFetch", "WebSearch":
+		if u, ok := input["url"].(string); ok {
+			return u
+		}
+		if q, ok := input["query"].(string); ok {
+			return q
+		}
+	}
+	return ""
+}
+
 // extractLastTurn reads the JSONL transcript and extracts text blocks from
 // the last assistant turn (after the last real user message).
 func extractLastTurn(transcriptPath string) []string {
@@ -493,27 +753,45 @@ func installProjectHooks(workDir string, config *Config) error {
 				},
 			},
 		},
-	}
-
-	// Only register PreToolUse permission hook when NOT in YOLO mode
-	if !config.SkipPermissions {
-		hooks["PreToolUse"] = []interface{}{
+		"PostToolUse": []interface{}{
 			map[string]interface{}{
 				"hooks": []interface{}{
 					map[string]interface{}{
 						"type":    "command",
-						"command": cccBin + " hook-permission" + hookArgs,
+						"command": cccBin + " hook-posttooluse" + hookArgs,
 					},
 				},
 			},
-		}
-	} else {
-		// YOLO mode: clean up leftover permission IPC files
-		cleanupPermissions()
+		},
 	}
 
+	// PreToolUse: always register monitoring hook; in non-YOLO also add permission hook
+	preToolUseHooks := []interface{}{
+		map[string]interface{}{
+			"type":    "command",
+			"command": cccBin + " hook-pretooluse" + hookArgs,
+		},
+	}
+	if !config.SkipPermissions {
+		preToolUseHooks = append(preToolUseHooks, map[string]interface{}{
+			"type":    "command",
+			"command": cccBin + " hook-permission" + hookArgs,
+		})
+	} else {
+		cleanupPermissions()
+	}
+	hooks["PreToolUse"] = []interface{}{
+		map[string]interface{}{
+			"hooks": preToolUseHooks,
+		},
+	}
+
+	cccBinForAllow := cccBin
 	settings := map[string]interface{}{
 		"hooks": hooks,
+		"allowedTools": []string{
+			fmt.Sprintf("Bash(%s tg-send *)", cccBinForAllow),
+		},
 	}
 
 	data, err := json.MarshalIndent(settings, "", "  ")
