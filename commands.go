@@ -74,7 +74,6 @@ func run(config *Config) error {
 	}
 
 	setBotCommands(config.BotToken)
-	sendMessage(config, config.ChatID, "Session started in: "+cwd)
 
 	fmt.Printf("Bot listening... (chat: %d, tmux: %s, dir: %s)\n", config.ChatID, tmuxSessionName(), cwd)
 	fmt.Printf("Attach to session: tmux attach -t %s\n", tmuxSessionName())
@@ -162,7 +161,7 @@ func listen(config *Config, workDir string) error {
 						}
 						prompt := fmt.Sprintf("%s %s", caption, imgPath)
 						sendMessage(config, chatID, "Image saved, sending to Claude...")
-						clearProgress()
+						clearProgress(config.ChatID)
 						stopTyping := startTypingLoop(config, chatID)
 						sendToTmuxWithDelay(tmuxSessionName(), prompt, 2*time.Second)
 						go func() {
@@ -189,7 +188,7 @@ func listen(config *Config, workDir string) error {
 							caption = fmt.Sprintf("%s\n\nFile: %s", caption, destPath)
 						}
 						sendMessage(config, chatID, fmt.Sprintf("File saved: %s", destPath))
-						clearProgress()
+						clearProgress(config.ChatID)
 						stopTyping := startTypingLoop(config, chatID)
 						sendToTmux(tmuxSessionName(), caption)
 						go func() {
@@ -232,7 +231,7 @@ func listen(config *Config, workDir string) error {
 
 			switch text {
 			case "/restart":
-				clearProgress()
+				clearProgress(config.ChatID)
 				sendMessage(config, chatID, "Restarting Claude session...")
 				killTmuxSession(tmuxSessionName())
 				time.Sleep(500 * time.Millisecond)
@@ -257,7 +256,7 @@ func listen(config *Config, workDir string) error {
 			ensureTmuxSession(config, workDir)
 			if tmuxSessionExists(tmuxSessionName()) {
 				// Clear old progress state before sending new message
-				clearProgress()
+				clearProgress(config.ChatID)
 				// Start typing indicator loop (refreshes every 4s until Claude responds)
 				stopTyping := startTypingLoop(config, chatID)
 				if err := sendToTmux(tmuxSessionName(), text); err != nil {

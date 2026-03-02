@@ -94,12 +94,12 @@ func handleStopHook() {
 	debugLog("transcriptPath: %s", hookData.TranscriptPath)
 
 	// Delete progress message — the final result replaces it
-	if state := loadProgress(); state != nil {
+	if state := loadProgress(config.ChatID); state != nil {
 		if state.MessageID != 0 {
 			deleteMessage(config, config.ChatID, state.MessageID)
 		}
 	}
-	clearProgress()
+	clearProgress(config.ChatID)
 
 	// Wait for transcript to be flushed to disk
 	time.Sleep(500 * time.Millisecond)
@@ -326,13 +326,13 @@ func handlePreToolUseHook() {
 
 	// Save transcript path so the polling goroutine can find it
 	if hookData.TranscriptPath != "" {
-		state := loadProgress()
+		state := loadProgress(config.ChatID)
 		if state == nil {
 			state = &progressState{}
 		}
 		if state.TranscriptPath != hookData.TranscriptPath {
 			state.TranscriptPath = hookData.TranscriptPath
-			saveProgress(state)
+			saveProgress(config.ChatID, state)
 		}
 	}
 
@@ -347,7 +347,7 @@ func handlePreToolUseHook() {
 		newLine = fmt.Sprintf("`%s` → %s", timeStr, hookData.ToolName)
 	}
 
-	state := loadProgress()
+	state := loadProgress(config.ChatID)
 	if state == nil {
 		state = &progressState{}
 	}
@@ -383,7 +383,7 @@ func handlePreToolUseHook() {
 		state.UpdatedAt = now.Unix()
 	}
 	state.Text = newText
-	saveProgress(state)
+	saveProgress(config.ChatID, state)
 
 	sendChatAction(config, config.ChatID, "typing")
 	// No output to stdout — Claude continues without waiting
@@ -402,7 +402,6 @@ type PostToolUseHookData struct {
 }
 
 const progressDir = "/tmp/ccc-progress"
-const progressFile = "/tmp/ccc-progress/status.json"
 
 type progressState struct {
 	MessageID      int    `json:"message_id"`
@@ -411,8 +410,12 @@ type progressState struct {
 	TranscriptPath string `json:"transcript_path,omitempty"`
 }
 
-func loadProgress() *progressState {
-	data, err := os.ReadFile(progressFile)
+func progressFilePath(chatID int64) string {
+	return fmt.Sprintf("%s/status-%d.json", progressDir, chatID)
+}
+
+func loadProgress(chatID int64) *progressState {
+	data, err := os.ReadFile(progressFilePath(chatID))
 	if err != nil {
 		return nil
 	}
@@ -423,14 +426,14 @@ func loadProgress() *progressState {
 	return &s
 }
 
-func saveProgress(s *progressState) {
+func saveProgress(chatID int64, s *progressState) {
 	os.MkdirAll(progressDir, 0755)
 	data, _ := json.Marshal(s)
-	os.WriteFile(progressFile, data, 0644)
+	os.WriteFile(progressFilePath(chatID), data, 0644)
 }
 
-func clearProgress() {
-	os.Remove(progressFile)
+func clearProgress(chatID int64) {
+	os.Remove(progressFilePath(chatID))
 }
 
 func handlePostToolUseHook() {
@@ -462,7 +465,7 @@ func handlePostToolUseHook() {
 		newLine = fmt.Sprintf("`%s` ✓ %s", timeStr, hookData.ToolName)
 	}
 
-	state := loadProgress()
+	state := loadProgress(config.ChatID)
 	if state == nil {
 		state = &progressState{}
 	}
@@ -501,7 +504,7 @@ func handlePostToolUseHook() {
 		state.UpdatedAt = now.Unix()
 	}
 	state.Text = newText
-	saveProgress(state)
+	saveProgress(config.ChatID, state)
 
 	sendChatAction(config, config.ChatID, "typing")
 }

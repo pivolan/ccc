@@ -308,6 +308,10 @@ func editMessageText(config *Config, chatID int64, messageID int, text string) e
 		return err
 	}
 	if !result.OK {
+		// "message is not modified" is not a real error — text was already the same
+		if strings.Contains(result.Description, "message is not modified") {
+			return nil
+		}
 		// Retry without markdown
 		params = url.Values{
 			"chat_id":    {fmt.Sprintf("%d", chatID)},
@@ -319,6 +323,9 @@ func editMessageText(config *Config, chatID int64, messageID int, text string) e
 			return err
 		}
 		if !result.OK {
+			if strings.Contains(result.Description, "message is not modified") {
+				return nil
+			}
 			return fmt.Errorf("telegram error: %s", result.Description)
 		}
 	}
