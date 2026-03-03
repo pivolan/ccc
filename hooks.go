@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -94,12 +95,14 @@ func handleStopHook() {
 	debugLog("transcriptPath: %s", hookData.TranscriptPath)
 
 	// Delete progress message — the final result replaces it
+	lk := lockProgress(config.ChatID)
 	if state := loadProgress(config.ChatID); state != nil {
 		if state.MessageID != 0 {
 			deleteMessage(config, config.ChatID, state.MessageID)
 		}
 	}
 	clearProgress(config.ChatID)
+	unlockProgress(lk)
 
 	// Wait for transcript to be flushed to disk
 	time.Sleep(500 * time.Millisecond)
@@ -127,8 +130,8 @@ type PermissionHookData struct {
 	ToolUseID      string          `json:"tool_use_id"`
 }
 
-const permissionsDir = "/tmp/ccc-permissions"
-const alwaysAllowFile = "/tmp/ccc-permissions/always_allow.json"
+var permissionsDir = filepath.Join(os.Getenv("HOME"), ".ccc-permissions")
+var alwaysAllowFile = filepath.Join(os.Getenv("HOME"), ".ccc-permissions", "always_allow.json")
 
 func loadAlwaysAllow() map[string]bool {
 	data, err := os.ReadFile(alwaysAllowFile)
@@ -324,22 +327,9 @@ func handlePreToolUseHook() {
 		return
 	}
 
-	// Save transcript path so the polling goroutine can find it
-	if hookData.TranscriptPath != "" {
-		state := loadProgress(config.ChatID)
-		if state == nil {
-			state = &progressState{}
-		}
-		if state.TranscriptPath != hookData.TranscriptPath {
-			state.TranscriptPath = hookData.TranscriptPath
-			saveProgress(config.ChatID, state)
-		}
-	}
-
 	// Update status message with what Claude is about to do
 	desc := formatToolProgressLine(hookData.ToolName, hookData.ToolInput)
-	now := time.Now()
-	timeStr := now.Format("15:04:05")
+	timeStr := time.Now().Format("15:04:05")
 	var newLine string
 	if desc != "" {
 		newLine = fmt.Sprintf("`%s` → %s: %s", timeStr, hookData.ToolName, desc)
@@ -347,46 +337,7 @@ func handlePreToolUseHook() {
 		newLine = fmt.Sprintf("`%s` → %s", timeStr, hookData.ToolName)
 	}
 
-	state := loadProgress(config.ChatID)
-	if state == nil {
-		state = &progressState{}
-	}
-
-	lines := strings.Split(state.Text, "\n")
-	if state.Text == "" {
-		lines = nil
-	}
-	lines = append(lines, newLine)
-	const maxLines = 5
-	if len(lines) > maxLines {
-		lines = lines[len(lines)-maxLines:]
-	}
-	newText := strings.Join(lines, "\n")
-
-	// Rate limit: only send/edit Telegram message if >= 3 seconds since last update
-	sinceLastUpdate := now.Unix() - state.UpdatedAt
-	if state.MessageID == 0 {
-		msgID, err := sendMessageGetID(config, config.ChatID, "⏳\n"+newText)
-		if err == nil {
-			state.MessageID = msgID
-		}
-		state.UpdatedAt = now.Unix()
-	} else if sinceLastUpdate >= 3 {
-		if editMessageText(config, config.ChatID, state.MessageID, "⏳\n"+newText) != nil {
-			oldMsgID := state.MessageID
-			msgID, err := sendMessageGetID(config, config.ChatID, "⏳\n"+newText)
-			if err == nil {
-				state.MessageID = msgID
-				deleteMessage(config, config.ChatID, oldMsgID)
-			}
-		}
-		state.UpdatedAt = now.Unix()
-	}
-	state.Text = newText
-	saveProgress(config.ChatID, state)
-
-	sendChatAction(config, config.ChatID, "typing")
-	// No output to stdout — Claude continues without waiting
+	updateProgress(config, config.ChatID, newLine, hookData.TranscriptPath)
 }
 
 // PostToolUse hook data — same fields as PreToolUse
@@ -401,7 +352,7 @@ type PostToolUseHookData struct {
 	ToolResponse   json.RawMessage `json:"tool_response,omitempty"`
 }
 
-const progressDir = "/tmp/ccc-progress"
+var progressDir = filepath.Join(os.Getenv("HOME"), ".ccc-progress")
 
 type progressState struct {
 	MessageID      int    `json:"message_id"`
@@ -412,6 +363,29 @@ type progressState struct {
 
 func progressFilePath(chatID int64) string {
 	return fmt.Sprintf("%s/status-%d.json", progressDir, chatID)
+}
+
+func progressLockPath(chatID int64) string {
+	return fmt.Sprintf("%s/status-%d.lock", progressDir, chatID)
+}
+
+func lockProgress(chatID int64) *os.File {
+	os.MkdirAll(progressDir, 0755)
+	f, err := os.OpenFile(progressLockPath(chatID), os.O_CREATE|os.O_RDWR, 0644)
+	if err != nil {
+		return nil
+	}
+	// Block until we get exclusive lock
+	syscall.Flock(int(f.Fd()), syscall.LOCK_EX)
+	return f
+}
+
+func unlockProgress(f *os.File) {
+	if f == nil {
+		return
+	}
+	syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+	f.Close()
 }
 
 func loadProgress(chatID int64) *progressState {
@@ -427,13 +401,65 @@ func loadProgress(chatID int64) *progressState {
 }
 
 func saveProgress(chatID int64, s *progressState) {
-	os.MkdirAll(progressDir, 0755)
+	if err := os.MkdirAll(progressDir, 0755); err != nil {
+		debugLog("saveProgress: MkdirAll %s failed: %v", progressDir, err)
+		return
+	}
 	data, _ := json.Marshal(s)
-	os.WriteFile(progressFilePath(chatID), data, 0644)
+	if err := os.WriteFile(progressFilePath(chatID), data, 0644); err != nil {
+		debugLog("saveProgress: WriteFile %s failed: %v", progressFilePath(chatID), err)
+	}
 }
 
 func clearProgress(chatID int64) {
 	os.Remove(progressFilePath(chatID))
+	os.Remove(progressLockPath(chatID))
+}
+
+// updateProgress adds a line to the progress message atomically (with file locking).
+// It either edits the existing Telegram message or creates one if none exists yet.
+func updateProgress(config *Config, chatID int64, newLine string, transcriptPath string) {
+	lk := lockProgress(chatID)
+	defer unlockProgress(lk)
+
+	state := loadProgress(chatID)
+	if state == nil {
+		state = &progressState{}
+	}
+	if transcriptPath != "" {
+		state.TranscriptPath = transcriptPath
+	}
+
+	lines := strings.Split(state.Text, "\n")
+	if state.Text == "" {
+		lines = nil
+	}
+	lines = append(lines, newLine)
+	const maxLines = 5
+	if len(lines) > maxLines {
+		lines = lines[len(lines)-maxLines:]
+	}
+	newText := strings.Join(lines, "\n")
+
+	now := time.Now()
+	sinceLastUpdate := now.Unix() - state.UpdatedAt
+
+	if state.MessageID == 0 {
+		// First message — create it
+		msgID, err := sendMessageGetID(config, chatID, "⏳\n"+newText)
+		if err == nil {
+			state.MessageID = msgID
+		}
+		state.UpdatedAt = now.Unix()
+	} else if sinceLastUpdate >= 3 {
+		// Edit existing message; on failure just skip this update (don't create new)
+		editMessageText(config, chatID, state.MessageID, "⏳\n"+newText)
+		state.UpdatedAt = now.Unix()
+	}
+	state.Text = newText
+	saveProgress(chatID, state)
+
+	sendChatAction(config, chatID, "typing")
 }
 
 func handlePostToolUseHook() {
@@ -456,8 +482,7 @@ func handlePostToolUseHook() {
 
 	// Build a short progress line for this tool
 	desc := formatToolProgressLine(hookData.ToolName, hookData.ToolInput)
-	now := time.Now()
-	timeStr := now.Format("15:04:05")
+	timeStr := time.Now().Format("15:04:05")
 	var newLine string
 	if desc != "" {
 		newLine = fmt.Sprintf("`%s` ✓ %s: %s", timeStr, hookData.ToolName, desc)
@@ -465,48 +490,7 @@ func handlePostToolUseHook() {
 		newLine = fmt.Sprintf("`%s` ✓ %s", timeStr, hookData.ToolName)
 	}
 
-	state := loadProgress(config.ChatID)
-	if state == nil {
-		state = &progressState{}
-	}
-	if hookData.TranscriptPath != "" {
-		state.TranscriptPath = hookData.TranscriptPath
-	}
-
-	lines := strings.Split(state.Text, "\n")
-	if state.Text == "" {
-		lines = nil
-	}
-	lines = append(lines, newLine)
-	const maxLines = 5
-	if len(lines) > maxLines {
-		lines = lines[len(lines)-maxLines:]
-	}
-	newText := strings.Join(lines, "\n")
-
-	// Rate limit: only send/edit Telegram message if >= 3 seconds since last update
-	sinceLastUpdate := now.Unix() - state.UpdatedAt
-	if state.MessageID == 0 {
-		msgID, err := sendMessageGetID(config, config.ChatID, "⏳\n"+newText)
-		if err == nil {
-			state.MessageID = msgID
-		}
-		state.UpdatedAt = now.Unix()
-	} else if sinceLastUpdate >= 3 {
-		if editMessageText(config, config.ChatID, state.MessageID, "⏳\n"+newText) != nil {
-			oldMsgID := state.MessageID
-			msgID, err := sendMessageGetID(config, config.ChatID, "⏳\n"+newText)
-			if err == nil {
-				state.MessageID = msgID
-				deleteMessage(config, config.ChatID, oldMsgID)
-			}
-		}
-		state.UpdatedAt = now.Unix()
-	}
-	state.Text = newText
-	saveProgress(config.ChatID, state)
-
-	sendChatAction(config, config.ChatID, "typing")
+	updateProgress(config, config.ChatID, newLine, hookData.TranscriptPath)
 }
 
 func formatToolProgressLine(toolName string, toolInput json.RawMessage) string {
@@ -789,12 +773,8 @@ func installProjectHooks(workDir string, config *Config) error {
 		},
 	}
 
-	cccBinForAllow := cccBin
 	settings := map[string]interface{}{
 		"hooks": hooks,
-		"allowedTools": []string{
-			fmt.Sprintf("Bash(%s tg-send *)", cccBinForAllow),
-		},
 	}
 
 	data, err := json.MarshalIndent(settings, "", "  ")
