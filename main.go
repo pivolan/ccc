@@ -16,6 +16,9 @@ type Config struct {
 	BotToken        string
 	ChatID          int64
 	SkipPermissions bool
+	GroupMode       bool
+	GroupID         int64 // used in hook subprocesses
+	TopicID         int   // used in hook subprocesses
 }
 
 // TelegramMessage represents a Telegram message
@@ -29,12 +32,15 @@ type TelegramMessage struct {
 		ID       int64  `json:"id"`
 		Username string `json:"username"`
 	} `json:"from"`
-	Text           string            `json:"text"`
-	ReplyToMessage *TelegramMessage  `json:"reply_to_message,omitempty"`
-	Voice          *TelegramVoice    `json:"voice,omitempty"`
-	Photo          []TelegramPhoto   `json:"photo,omitempty"`
-	Document       *TelegramDocument `json:"document,omitempty"`
-	Caption        string            `json:"caption,omitempty"`
+	Text              string            `json:"text"`
+	MessageThreadID   int               `json:"message_thread_id,omitempty"`
+	IsTopicMessage    bool              `json:"is_topic_message,omitempty"`
+	ForumTopicCreated *struct{}         `json:"forum_topic_created,omitempty"`
+	ReplyToMessage    *TelegramMessage  `json:"reply_to_message,omitempty"`
+	Voice             *TelegramVoice    `json:"voice,omitempty"`
+	Photo             []TelegramPhoto   `json:"photo,omitempty"`
+	Document          *TelegramDocument `json:"document,omitempty"`
+	Caption           string            `json:"caption,omitempty"`
 }
 
 type TelegramVoice struct {
@@ -124,10 +130,16 @@ func main() {
 
 	// Parse remaining args: token and optional flags
 	var token string
+	var chatIDFlag string
 	skipPerms := false
+	groupMode := false
 	for _, arg := range os.Args[1:] {
 		if arg == "--yolo" {
 			skipPerms = true
+		} else if arg == "--group" {
+			groupMode = true
+		} else if strings.HasPrefix(arg, "--chat-id=") {
+			chatIDFlag = strings.TrimPrefix(arg, "--chat-id=")
 		} else if !strings.HasPrefix(arg, "-") {
 			token = arg
 		}
@@ -138,15 +150,30 @@ func main() {
 		os.Exit(1)
 	}
 
-	fmt.Println("Send any message to your bot in Telegram...")
-	chatID, err := waitForFirstMessage(token)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
-	}
-	fmt.Printf("Connected! Chat ID: %d\n", chatID)
+	config := &Config{BotToken: token, SkipPermissions: skipPerms, GroupMode: groupMode}
 
-	config := &Config{BotToken: token, ChatID: chatID, SkipPermissions: skipPerms}
+	if chatIDFlag != "" {
+		chatID, err := strconv.ParseInt(chatIDFlag, 10, 64)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Invalid --chat-id: %s\n", chatIDFlag)
+			os.Exit(1)
+		}
+		config.ChatID = chatID
+		fmt.Printf("Using preset Chat ID: %d\n", chatID)
+	} else if groupMode {
+		fmt.Println("Starting in group mode...")
+		config.ChatID = 0
+	} else {
+		fmt.Println("Send any message to your bot in Telegram...")
+		chatID, err := waitForFirstMessage(token)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("Connected! Chat ID: %d\n", chatID)
+		config.ChatID = chatID
+	}
+
 	if err := run(config); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
@@ -222,18 +249,22 @@ func printHelp() {
 	fmt.Printf(`ccc - Claude Code Companion v%s
 
 USAGE:
-    ccc <bot_token>         Start bot (creates tmux + Claude, polls Telegram)
-    ccc <bot_token> --yolo  Start with auto-accept all permissions
-    ccc tg-send             Send file/message to Telegram (used by Claude)
+    ccc <bot_token>          Start bot (creates tmux + Claude, polls Telegram)
+    ccc <bot_token> --yolo   Start with auto-accept all permissions
+    ccc <bot_token> --group  Start in group mode (topics = sessions)
+    ccc tg-send              Send file/message to Telegram (used by Claude)
 
 FLAGS:
-    -h, --help              Show this help
-    -v, --version           Show version
-    --yolo                  Skip all Claude permission prompts
+    -h, --help               Show this help
+    -v, --version            Show version
+    --yolo                   Skip all Claude permission prompts
+    --group                  Enable group mode with topic-based sessions
+    --chat-id=ID             Pre-set authorized chat ID (skip first-message wait)
 
 TELEGRAM COMMANDS:
     /c <cmd>                Execute shell command
-    /restart                Restart Claude session
+    /restart                Restart Claude session (current topic or main)
+    /topic <name> <path>    Create a new topic with its own Claude session
     /stats                  Show system stats
     /version                Show version
 

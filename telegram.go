@@ -53,7 +53,17 @@ func telegramAPI(config *Config, method string, params url.Values) (*TelegramRes
 	return &result, nil
 }
 
-func sendMessage(config *Config, chatID int64, text string) error {
+func addThreadID(params url.Values, threadID int) {
+	if threadID > 0 {
+		params.Set("message_thread_id", fmt.Sprintf("%d", threadID))
+	}
+}
+
+func sendMessage(config *Config, chatID int64, text string, threadID ...int) error {
+	tid := 0
+	if len(threadID) > 0 {
+		tid = threadID[0]
+	}
 	const maxLen = 4000
 
 	messages := splitMessage(text, maxLen)
@@ -65,6 +75,7 @@ func sendMessage(config *Config, chatID int64, text string) error {
 			"text":       {msg},
 			"parse_mode": {"Markdown"},
 		}
+		addThreadID(params, tid)
 
 		result, err := telegramAPI(config, "sendMessage", params)
 		if err != nil {
@@ -77,6 +88,7 @@ func sendMessage(config *Config, chatID int64, text string) error {
 				"chat_id": {fmt.Sprintf("%d", chatID)},
 				"text":    {msg},
 			}
+			addThreadID(params, tid)
 			result, err = telegramAPI(config, "sendMessage", params)
 			if err != nil {
 				return err
@@ -122,12 +134,17 @@ func splitMessage(text string, maxLen int) []string {
 	return messages
 }
 
-func sendMessageGetID(config *Config, chatID int64, text string) (int, error) {
+func sendMessageGetID(config *Config, chatID int64, text string, threadID ...int) (int, error) {
+	tid := 0
+	if len(threadID) > 0 {
+		tid = threadID[0]
+	}
 	params := url.Values{
 		"chat_id":    {fmt.Sprintf("%d", chatID)},
 		"text":       {text},
 		"parse_mode": {"Markdown"},
 	}
+	addThreadID(params, tid)
 	result, err := telegramAPI(config, "sendMessage", params)
 	if err != nil {
 		return 0, err
@@ -137,6 +154,7 @@ func sendMessageGetID(config *Config, chatID int64, text string) (int, error) {
 			"chat_id": {fmt.Sprintf("%d", chatID)},
 			"text":    {text},
 		}
+		addThreadID(params, tid)
 		result, err = telegramAPI(config, "sendMessage", params)
 		if err != nil {
 			return 0, err
@@ -152,7 +170,11 @@ func sendMessageGetID(config *Config, chatID int64, text string) (int, error) {
 	return msg.MessageID, nil
 }
 
-func sendMessageWithKeyboard(config *Config, chatID int64, text string, keyboard interface{}) (int, error) {
+func sendMessageWithKeyboard(config *Config, chatID int64, text string, keyboard interface{}, threadID ...int) (int, error) {
+	tid := 0
+	if len(threadID) > 0 {
+		tid = threadID[0]
+	}
 	kbJSON, err := json.Marshal(keyboard)
 	if err != nil {
 		return 0, err
@@ -163,6 +185,7 @@ func sendMessageWithKeyboard(config *Config, chatID int64, text string, keyboard
 		"text":         {text},
 		"reply_markup": {string(kbJSON)},
 	}
+	addThreadID(params, tid)
 
 	result, err := telegramAPI(config, "sendMessage", params)
 	if err != nil {
@@ -212,7 +235,7 @@ func sendVideo(config *Config, chatID int64, filePath string, caption string) er
 	return sendFileMultipart(config, chatID, filePath, caption, "video", "sendVideo")
 }
 
-func sendFileMultipart(config *Config, chatID int64, filePath string, caption string, fieldName string, apiMethod string) error {
+func sendFileMultipart(config *Config, chatID int64, filePath string, caption string, fieldName string, apiMethod string, threadID ...int) error {
 	file, err := os.Open(filePath)
 	if err != nil {
 		return err
@@ -223,6 +246,9 @@ func sendFileMultipart(config *Config, chatID int64, filePath string, caption st
 	writer := multipart.NewWriter(body)
 
 	writer.WriteField("chat_id", fmt.Sprintf("%d", chatID))
+	if len(threadID) > 0 && threadID[0] > 0 {
+		writer.WriteField("message_thread_id", fmt.Sprintf("%d", threadID[0]))
+	}
 	if caption != "" {
 		writer.WriteField("caption", caption)
 	}
@@ -289,14 +315,18 @@ func downloadTelegramFile(config *Config, fileID string, destPath string) error 
 	return err
 }
 
-func sendChatAction(config *Config, chatID int64, action string) {
-	telegramAPI(config, "sendChatAction", url.Values{
+func sendChatAction(config *Config, chatID int64, action string, threadID ...int) {
+	params := url.Values{
 		"chat_id": {fmt.Sprintf("%d", chatID)},
 		"action":  {action},
-	})
+	}
+	if len(threadID) > 0 {
+		addThreadID(params, threadID[0])
+	}
+	telegramAPI(config, "sendChatAction", params)
 }
 
-func editMessageText(config *Config, chatID int64, messageID int, text string) error {
+func editMessageText(config *Config, chatID int64, messageID int, text string, threadID ...int) error {
 	params := url.Values{
 		"chat_id":    {fmt.Sprintf("%d", chatID)},
 		"message_id": {fmt.Sprintf("%d", messageID)},
@@ -308,11 +338,9 @@ func editMessageText(config *Config, chatID int64, messageID int, text string) e
 		return err
 	}
 	if !result.OK {
-		// "message is not modified" is not a real error — text was already the same
 		if strings.Contains(result.Description, "message is not modified") {
 			return nil
 		}
-		// Retry without markdown
 		params = url.Values{
 			"chat_id":    {fmt.Sprintf("%d", chatID)},
 			"message_id": {fmt.Sprintf("%d", messageID)},
@@ -332,10 +360,32 @@ func editMessageText(config *Config, chatID int64, messageID int, text string) e
 	return nil
 }
 
+func createForumTopic(config *Config, chatID int64, name string) (int, error) {
+	params := url.Values{
+		"chat_id": {fmt.Sprintf("%d", chatID)},
+		"name":    {name},
+	}
+	result, err := telegramAPI(config, "createForumTopic", params)
+	if err != nil {
+		return 0, err
+	}
+	if !result.OK {
+		return 0, fmt.Errorf("telegram error: %s", result.Description)
+	}
+	var topic struct {
+		MessageThreadID int `json:"message_thread_id"`
+	}
+	if err := json.Unmarshal(result.Result, &topic); err != nil {
+		return 0, err
+	}
+	return topic.MessageThreadID, nil
+}
+
 func setBotCommands(botToken string) {
 	commands := []map[string]string{
 		{"command": "c", "description": "Execute shell command: /c <cmd>"},
 		{"command": "restart", "description": "Restart Claude session"},
+		{"command": "topic", "description": "Create topic session: /topic <name> <folder>"},
 		{"command": "version", "description": "Show ccc version"},
 		{"command": "stats", "description": "Show system stats"},
 	}
